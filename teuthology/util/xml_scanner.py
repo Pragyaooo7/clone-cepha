@@ -4,21 +4,24 @@ import yaml
 from collections import defaultdict
 from lxml import etree
 
-log = logging.Logger(__name__)
+log = logging.getLogger(__name__)
 
 
 class XMLScanner():
-    def __init__(self, client=None, yaml_path=None) -> None:
+    def __init__(self, remote=None, yaml_path=None) -> None:
         self.yaml_data = []
         self.yaml_path = yaml_path
-        self.client = client
+        self.remote = remote
 
-    def scan_all_files_in_dir(self, dir_path: str, ext: str):
+    def scan_all_files(self, path_regex: str):
         """
-        :param dir_path: Scan all files here. Example: /path/to/dir/
-        :param ext     : Extension of files to scan. Example: "xml" or "log"
+        :param path_regex: Regex string to find all the files which have to be scanned. 
+                           Example: /path/to/dir/*.xml
         """
-        (_, stdout, _) = self.client.exec_command(f'ls -d {dir_path}*.{ext}', timeout=200)
+        (_, stdout, stderr) = self.remote.ssh.exec_command(f'ls -d {path_regex}', timeout=200)
+        if stderr:
+            log.info("XML_DEBUG: stderr " + stderr.read().decode())    
+            return []
         files = stdout.read().decode().split('\n')
         log.info("XML_DEBUG: all file paths are " + " ".join(files))
         
@@ -32,28 +35,40 @@ class XMLScanner():
         return errors
 
     def scan_file(self, path): 
+        """ 
+        Scans a xml file and 
+        collect data in self.yaml_data.
+
+        :path: exact path to single xml file.
+        """
         if not path:
             return None
-        (_, stdout, _) = self.client.exec_command(f'cat {path}', timeout=200)
+        (_, stdout, _) = self.remote.ssh.exec_command(f'cat {path}', timeout=200)
         if stdout:
             xml_tree = etree.parse(stdout)
-            error_txt, error_data = self.get_error(xml_tree)
-            if error_data:
-                error_data["xml_file"] = path
-                self.yaml_data += [error_data]
-            return error_txt
+            txt, data = self._parse(xml_tree)
+            if data:
+                data["xml_file"] = path
+                self.yaml_data += [data]
+            return txt
         log.debug(f'XML output not found at `{str(path)}`!')
 
-    def get_error(self):
-        # defined in inherited classes
-        pass
+    def _parse(self, xml_tree):
+        """
+        This parses xml_tree and returns:
+        :returns: a message string 
+        :returns: data (to add in summary yaml file)
+
+        Just an abstract class in XMLScanner, 
+        to be defined in inherited classes. 
+        """
+        return None, None
     
     def write_logs(self):
         yamlfile = self.yaml_path
         if self.yaml_data:
             try:
-                sftp = self.client.open_sftp()
-                remote_yaml_file = sftp.open(yamlfile, "w")
+                remote_yaml_file = self.remote._sftp_open_file(yamlfile, "a")
                 yaml.safe_dump(self.yaml_data, remote_yaml_file, default_flow_style=False)
                 remote_yaml_file.close()
             except Exception as exc: 
@@ -64,14 +79,20 @@ class XMLScanner():
 
 
 class UnitTestScanner(XMLScanner):
-    def __init__(self, client=None) -> None:
-        super().__init__(client)
-        self.yaml_path = "/home/ubuntu/cephtest/archive/unittest_failures.yaml"
+    def __init__(self, remote=None, yaml_path=None) -> None:
+        yaml_path = yaml_path or "/home/ubuntu/cephtest/archive/unittest_failures.yaml"
+        super().__init__(remote, yaml_path)
 
-    def get_error_msg(self, xml_path):
+    def get_exception_msg(self, xml_path: str):
+        """
+        :param xml_path: Path to unit-test xml files. 
+                         If xml_path ends with "/" then, 
+                         all files (of .xml extension) under that dir would be scanned. 
+                         Otherwise, xml_path would be absolute path to a single xml file.
+        """
         try:
             if xml_path[-1] == "/":
-                errors = self.scan_all_files_in_dir(xml_path, "xml")
+                errors = self.scan_all_files(f'{xml_path}*.xml')
                 if errors:
                     return errors[0]
                 log.debug("UnitTestScanner: No error found in XML output")
@@ -82,13 +103,9 @@ class UnitTestScanner(XMLScanner):
                 return error
         except Exception as exc:
             log.exception(exc)
-            log.info("XML_DEBUG: get_error_msg: " + repr(exc))
+            log.info("XML_DEBUG: get_exception_msg: " + repr(exc))
 
-    def get_error(self, xml_tree):
-        """
-        Returns message of first error found.
-        And stores info of all errors in yaml_data. 
-        """
+    def _parse(self, xml_tree):
         root = xml_tree.getroot()
         if int(root.get("failures", -1)) == 0 and int(root.get("errors", -1)) == 0:
             log.debug("No failures or errors in unit test.")
@@ -120,9 +137,55 @@ class UnitTestScanner(XMLScanner):
 
 
 class ValgrindScanner(XMLScanner):
-    def __init__(self, client=None) -> None:
-        super().__init__(client)
-        self.yaml_path = "/home/ubuntu/cephtest/archive/valgrind.yaml"
+    def __init__(self, remote=None, yaml_path=None) -> None:
+        super().__init__(remote, yaml_path)
 
-    def get_error(self, xml_tree):
-        pass 
+    def get_exception_msg(self):
+        try:
+            errors = self.scan_all_files('/var/log/ceph/valgrind/*')
+            log.info("XML_DEBUG: ")
+            log.info(errors)
+            if errors:
+                return errors[0]
+            return None
+        except Exception as exc:
+            log.exception(exc)
+            log.info("Failed to get valgrind error: " + repr(exc))
+
+
+    def _parse(self, xml_tree):
+        if not xml_tree:
+            return None, None
+        error_tree = xml_tree.find('error')
+
+        if not len(error_tree):
+            log.info("XML_DEBUG: error_tree empty. <error> tag not found.")
+            return None, None
+
+        error_data = {}
+
+        error_data["kind"] = error_tree.find('kind').text
+        error_data["threadname"] = error_tree.find('threadname').text
+        error_traceback = []
+        stack = error_tree.find('stack')
+        for frame in stack:
+            if len(error_traceback) >= 5:
+                break
+            curr_frame = {
+                'file': f'{frame.find("dir").text}/{frame.find("file").text}',
+                'line': frame.find('line').text,
+                'function': frame.find('fn').text,
+            }
+            error_traceback += [curr_frame]
+        error_data["traceback"] = error_traceback
+        
+        exception_text = f"valgrind error: {error_data['kind']} in {error_data['threadname']}" 
+        return exception_text, error_data
+    
+    def write_logs(self):
+        yamlfile = self.yaml_path
+        if self.yaml_data:
+            with open(yamlfile, 'a') as f:
+                yaml.safe_dump(self.yaml_data, f, default_flow_style=False)
+        else:
+            log.info("Failed to write in valgrind.yaml: yaml_data is empty!")

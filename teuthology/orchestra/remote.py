@@ -520,7 +520,7 @@ class Remote(RemoteShell):
             if unittest_xml:
                 error_msg = None
                 try:
-                    error_msg = UnitTestScanner(client=self.ssh).get_error_msg(unittest_xml)
+                    error_msg = UnitTestScanner(remote=self).get_exception_msg(unittest_xml)
                 except Exception as scanner_exc:
                     log.exception(scanner_exc)
                 if error_msg:
@@ -552,12 +552,14 @@ class Remote(RemoteShell):
         sftp.get(remote_path, local_path)
         return local_path
 
-    def _sftp_open_file(self, remote_path):
+    def _sftp_open_file(self, remote_path, mode=None):
         """
         Use the paramiko.SFTPClient to open a file. Returns a
         paramiko.SFTPFile object.
         """
         sftp = self.ssh.open_sftp()
+        if mode:
+            return sftp.open(remote_path, mode)
         return sftp.open(remote_path)
 
     def _sftp_get_size(self, remote_path):
